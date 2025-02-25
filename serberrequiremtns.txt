@@ -1,0 +1,3 @@
+fastapi==0.110.0        # FastAPI framework for the API server
+uvicorn==0.29.0         # ASGI server to run FastAPI
+pymongo==4.6.2          # MongoDB client

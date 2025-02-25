@@ -1,0 +1,5 @@
+psutil==5.9.8           # System monitoring (CPU, memory, processes, etc.)
+pymongo==4.6.2          # MongoDB client
+scapy==2.5.0            # Packet sniffing for DNS queries
+watchdog==4.0.0         # File system event monitoring
+pywin32==306            # Windows-specific APIs (event logs, registry, etc.)

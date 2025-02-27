@@ -19,7 +19,16 @@ import winreg
 import win32com.client
 import subprocess
 import hashlib
-from scapy.all import sniff, DNS
+import shutil
+import pkg_resources
+
+# Try importing scapy, install Npcap if it fails
+try:
+    from scapy.all import sniff, DNS
+except ImportError:
+    scapy_installed = False
+else:
+    scapy_installed = True
 
 # Configure logging
 logging.basicConfig(
@@ -30,7 +39,92 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # API endpoint configuration
-API_BASE_URL = "http://localhost:8000/api/v1"  # Update this to your server's URL if different
+API_BASE_URL = "https://zyrabackendapi.onrender.com"  # Update this to your server's URL if different
+
+# Dependency installation functions
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except:
+        return False
+
+def run_as_admin():
+    if is_admin():
+        return True
+    try:
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, f'"{os.path.abspath(__file__)}" {" ".join(sys.argv[1:])}', None, 1
+        )
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Failed to elevate privileges: {e}")
+        return False
+
+def install_dependency(package_name):
+    """Install a Python package using pip."""
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+        logger.info(f"Successfully installed {package_name}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to install {package_name}: {e}")
+        sys.exit(1)
+
+def check_and_install_npcap():
+    """Check for Npcap and install it silently if missing."""
+    if not scapy_installed:
+        logger.warning("Scapy not installed, Npcap check skipped until Python dependencies are installed.")
+        return False
+    try:
+        # Npcap is installed if scapy can sniff without errors
+        sniff(count=1, timeout=1)  # Quick test
+        logger.info("Npcap is already installed.")
+        return True
+    except Exception:
+        logger.info("Npcap not detected, attempting installation...")
+        npcap_installer = "npcap-1.79.exe"  # Replace with latest version if needed
+        if not os.path.exists(npcap_installer):
+            logger.info("Downloading Npcap installer...")
+            npcap_url = "https://npcap.com/dist/npcap-1.79.exe"  # Update URL if version changes
+            try:
+                response = requests.get(npcap_url, stream=True)
+                with open(npcap_installer, "wb") as f:
+                    shutil.copyfileobj(response.raw, f)
+            except Exception as e:
+                logger.error(f"Failed to download Npcap: {e}")
+                sys.exit(1)
+        
+        try:
+            # Silent install with WinPcap compatibility
+            subprocess.check_call([npcap_installer, "/S", "/winpcap_mode=yes"])
+            logger.info("Npcap installed successfully.")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to install Npcap: {e}")
+            sys.exit(1)
+
+def install_requirements():
+    """Ensure all Python dependencies and Npcap are installed."""
+    if not is_admin():
+        logger.error("Admin privileges required to install dependencies.")
+        run_as_admin()
+        sys.exit(1)
+
+    # List of required Python packages
+    required = {"requests", "psutil", "watchdog", "scapy", "pywin32"}
+    installed = {pkg.key for pkg in pkg_resources.working_set}
+    missing = required - installed
+
+    if missing:
+        logger.info(f"Installing missing Python packages: {missing}")
+        for pkg in missing:
+            install_dependency(pkg)
+        # Reload the script after installing dependencies
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    # Check and install Npcap
+    if not check_and_install_npcap():
+        logger.error("Npcap installation required for DNS sniffing but failed.")
+        sys.exit(1)
 
 class AnomalyDetector:
     def __init__(self):
@@ -111,7 +205,7 @@ class FileEventHandler(FileSystemEventHandler):
 class SystemMonitor:
     def __init__(self, require_admin: bool = False, monitor_path: str = ".", config_files: List[str] = None):
         self.os_type = platform.system()
-        self.is_admin = self._check_admin()
+        self.is_admin = is_admin()
         self.require_admin = require_admin
         self.running = False
         self.data_queue = queue.Queue()
@@ -133,35 +227,10 @@ class SystemMonitor:
         
         if require_admin and not self.is_admin:
             logger.warning("Admin privileges required - attempting to elevate")
-            if self._request_admin():
+            if run_as_admin():
                 return
             else:
                 raise PermissionError("This script requires administrative privileges and elevation failed")
-
-    def _check_admin(self) -> bool:
-        if self.os_type == "Windows":
-            try:
-                return ctypes.windll.shell32.IsUserAnAdmin() != 0
-            except:
-                return False
-        else:
-            return os.geteuid() == 0 if hasattr(os, 'geteuid') else False
-
-    def _request_admin(self) -> bool:
-        if self.is_admin:
-            return True
-        if self.os_type == "Windows":
-            try:
-                result = ctypes.windll.shell32.ShellExecuteW(
-                    None, "runas", sys.executable, f'"{os.path.abspath(__file__)}" {" ".join(sys.argv[1:])}', None, 1
-                )
-                if result > 32:
-                    sys.exit(0)
-                return False
-            except Exception as e:
-                logger.error(f"Failed to elevate privileges: {e}")
-                return False
-        return False
 
     def _get_file_hash(self, file_path: str) -> str:
         try:
@@ -294,7 +363,7 @@ class SystemMonitor:
                         anomaly = self.anomaly_detector.check_login_anomaly(event_data)
                         if anomaly:
                             anomaly["device_id"] = self.device_id
-                            anomaly["hostname"] = self.hostname,
+                            anomaly["hostname"] = self.hostname
                             anomaly["data"] = {"system_name": self.system_name, **anomaly}
                             del anomaly["timestamp"]  # Avoid nesting timestamp
                             anomaly["timestamp"] = datetime.now().isoformat()
@@ -758,9 +827,12 @@ class SystemMonitor:
         logger.info("Shutting down monitor...")
 
 if __name__ == "__main__":
+    # Check and install dependencies before starting
+    install_requirements()
+    
     monitor = SystemMonitor(
         require_admin=True,
-        monitor_path="C:\\Users\\Adnan\\Desktop\\Zyra",
+        monitor_path="C:\\Users",
         config_files=[r"C:\Windows\System32\drivers\etc\hosts"]
     )
     try:

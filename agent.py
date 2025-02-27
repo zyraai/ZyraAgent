@@ -2,9 +2,7 @@ import psutil
 import socket
 import time
 from datetime import datetime
-from pymongo import MongoClient
-import urllib.parse
-from scapy.all import sniff, DNS
+import requests
 import logging
 import platform
 from typing import Dict, List, Optional
@@ -21,6 +19,7 @@ import winreg
 import win32com.client
 import subprocess
 import hashlib
+from scapy.all import sniff, DNS
 
 # Configure logging
 logging.basicConfig(
@@ -30,10 +29,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# MongoDB credentials
-USERNAME = urllib.parse.quote_plus("zyraadmin")
-PASSWORD = urllib.parse.quote_plus("Hacker@66202")
-MONGO_URI = f"mongodb+srv://{USERNAME}:{PASSWORD}@zyracluster.9zq1b.mongodb.net/?retryWrites=true&w=majority&appName=ZyraCluster"
+# API endpoint configuration
+API_BASE_URL = "http://localhost:8000/api/v1"  # Update this to your server's URL if different
 
 class AnomalyDetector:
     def __init__(self):
@@ -113,7 +110,6 @@ class FileEventHandler(FileSystemEventHandler):
 
 class SystemMonitor:
     def __init__(self, require_admin: bool = False, monitor_path: str = ".", config_files: List[str] = None):
-        self.client = None
         self.os_type = platform.system()
         self.is_admin = self._check_admin()
         self.require_admin = require_admin
@@ -168,12 +164,21 @@ class SystemMonitor:
         return False
 
     def _get_file_hash(self, file_path: str) -> str:
-        """Calculate SHA256 hash of a file"""
         try:
             with open(file_path, "rb") as f:
                 return hashlib.sha256(f.read()).hexdigest()
         except Exception:
             return ""
+
+    def _send_data_to_server(self, data):
+        try:
+            response = requests.post(f"{API_BASE_URL}/data", json=data)
+            if response.status_code == 200:
+                logger.info(f"Sent {data['type']} data to server for device {self.device_id}")
+            else:
+                logger.error(f"Failed to send data: {response.status_code} - {response.text}")
+        except Exception as e:
+            logger.error(f"Error sending data to server: {e}")
 
     def get_system_info(self):
         while self.running:
@@ -289,8 +294,10 @@ class SystemMonitor:
                         anomaly = self.anomaly_detector.check_login_anomaly(event_data)
                         if anomaly:
                             anomaly["device_id"] = self.device_id
-                            anomaly["hostname"] = self.hostname
-                            anomaly["system_name"] = self.system_name
+                            anomaly["hostname"] = self.hostname,
+                            anomaly["data"] = {"system_name": self.system_name, **anomaly}
+                            del anomaly["timestamp"]  # Avoid nesting timestamp
+                            anomaly["timestamp"] = datetime.now().isoformat()
                             self.data_queue.put(anomaly)
                 time.sleep(1)
             win32evtlog.CloseEventLog(hand)
@@ -449,7 +456,6 @@ class SystemMonitor:
             logger.error(f"Error monitoring remote commands: {e}")
 
     def monitor_services(self):
-        """Monitor service status changes"""
         while self.running:
             try:
                 if self.os_type == "Windows" and self.is_admin:
@@ -513,7 +519,6 @@ class SystemMonitor:
                 time.sleep(5)
 
     def monitor_config_files(self):
-        """Monitor critical configuration files"""
         event_handler = FileEventHandler(self.data_queue, self.device_id, self.hostname)
         observer = Observer()
         for config_file in self.config_files:
@@ -548,7 +553,6 @@ class SystemMonitor:
         observer.join()
 
     def protect_agent(self):
-        """Protect agent from modification or termination"""
         while self.running:
             try:
                 current_hash = self._get_file_hash(self.agent_file)
@@ -565,7 +569,6 @@ class SystemMonitor:
                         "timestamp": datetime.now().isoformat()
                     }
                     self.data_queue.put(data)
-                    # Attempt to restart (simplified; real restart would need OS-specific logic)
                     os.system(f"python {self.agent_file} &")
                     sys.exit(1)
                 
@@ -590,59 +593,53 @@ class SystemMonitor:
                 time.sleep(5)
 
     def remote_control(self):
-        """Listen for remote commands from MongoDB"""
         while self.running:
             try:
-                self.client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-                db = self.client["siem_db"]
-                commands_collection = db["agent_commands"]
-                command = commands_collection.find_one({"device_id": self.device_id, "processed": False})
-                if command:
-                    cmd = command.get("command")
-                    if cmd == "kill_process" and "pid" in command:
-                        pid = command["pid"]
-                        try:
-                            process = psutil.Process(pid)
-                            process.terminate()
-                            result = f"Terminated process {pid}"
-                        except Exception as e:
-                            result = f"Failed to terminate {pid}: {e}"
-                    elif cmd == "collect_file" and "path" in command:
-                        path = command["path"]
-                        try:
-                            with open(path, "rb") as f:
-                                file_content = f.read()
-                            result = f"Collected {len(file_content)} bytes from {path}"
-                            # Could store file_content in DB if needed
-                        except Exception as e:
-                            result = f"Failed to collect {path}: {e}"
-                    else:
-                        result = f"Unknown command: {cmd}"
-                    
-                    data = {
-                        "device_id": self.device_id,
-                        "hostname": self.hostname,
-                        "type": "remote_response",
-                        "data": {
-                            "system_name": self.system_name,
-                            "command": cmd,
-                            "result": result
-                        },
-                        "timestamp": datetime.now().isoformat()
-                    }
-                    self.data_queue.put(data)
-                    commands_collection.update_one({"_id": command["_id"]}, {"$set": {"processed": True}})
+                response = requests.get(f"{API_BASE_URL}/{self.device_id}/commands")
+                if response.status_code == 200:
+                    commands = response.json()
+                    for cmd_doc in commands:
+                        if not cmd_doc.get("processed", False):
+                            cmd = cmd_doc["command"]
+                            if cmd == "kill_process" and "pid" in cmd_doc:
+                                pid = cmd_doc["pid"]
+                                try:
+                                    process = psutil.Process(pid)
+                                    process.terminate()
+                                    result = f"Terminated process {pid}"
+                                except Exception as e:
+                                    result = f"Failed to terminate {pid}: {e}"
+                            elif cmd == "collect_file" and "path" in cmd_doc:
+                                path = cmd_doc["path"]
+                                try:
+                                    with open(path, "rb") as f:
+                                        file_content = f.read()
+                                    result = f"Collected {len(file_content)} bytes from {path}"
+                                except Exception as e:
+                                    result = f"Failed to collect {path}: {e}"
+                            else:
+                                result = f"Unknown command: {cmd}"
+                            
+                            data = {
+                                "device_id": self.device_id,
+                                "hostname": self.hostname,
+                                "type": "remote_response",
+                                "data": {
+                                    "system_name": self.system_name,
+                                    "command": cmd,
+                                    "result": result
+                                },
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            self.data_queue.put(data)
+                            # Mark command as processed
+                            requests.put(f"{API_BASE_URL}/commands/{cmd_doc['command_id']}", json={"processed": True})
                 time.sleep(5)
             except Exception as e:
                 logger.error(f"Error in remote control: {e}")
                 time.sleep(5)
-            finally:
-                if self.client:
-                    self.client.close()
-                    self.client = None
 
     def monitor_uptime(self):
-        """Track system uptime and detect reboots"""
         while self.running:
             try:
                 current_boot_time = psutil.boot_time()
@@ -679,23 +676,8 @@ class SystemMonitor:
                 time.sleep(10)
 
     def update_agent_status(self):
-        """Update agent status in DB"""
         while self.running:
             try:
-                self.client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-                db = self.client["siem_db"]
-                status_collection = db["agent_status"]
-                status = {
-                    "device_id": self.device_id,
-                    "hostname": self.hostname,
-                    "status": "online",
-                    "last_seen": datetime.now().isoformat()
-                }
-                status_collection.update_one(
-                    {"device_id": self.device_id},
-                    {"$set": status},
-                    upsert=True
-                )
                 data = {
                     "device_id": self.device_id,
                     "hostname": self.hostname,
@@ -711,30 +693,18 @@ class SystemMonitor:
             except Exception as e:
                 logger.error(f"Error updating agent status: {e}")
                 time.sleep(30)
-            finally:
-                if self.client:
-                    self.client.close()
-                    self.client = None
 
     def store_data(self):
         while self.running:
             try:
-                self.client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-                db = self.client["siem_db"]
-                collection = db["device_data"]
                 while not self.data_queue.empty():
                     data = self.data_queue.get()
-                    result = collection.insert_one(data)
-                    logger.info(f"Stored {data['type']} data for device {self.device_id} with ID: {result.inserted_id}")
+                    self._send_data_to_server(data)
                     self.data_queue.task_done()
                 time.sleep(0.1)
             except Exception as e:
-                logger.error(f"Database error: {e}")
+                logger.error(f"Error in data storage thread: {e}")
                 time.sleep(1)
-            finally:
-                if self.client:
-                    self.client.close()
-                    self.client = None
 
     def start(self):
         if self.running:
@@ -770,27 +740,28 @@ class SystemMonitor:
 
     def stop(self):
         self.running = False
-        # Update status to offline
+        # Send offline status
         try:
-            self.client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-            db = self.client["siem_db"]
-            status_collection = db["agent_status"]
-            status_collection.update_one(
-                {"device_id": self.device_id},
-                {"$set": {"status": "offline", "last_seen": datetime.now().isoformat()}}
-            )
+            data = {
+                "device_id": self.device_id,
+                "hostname": self.hostname,
+                "type": "agent_status",
+                "data": {
+                    "system_name": self.system_name,
+                    "status": "offline"
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            self._send_data_to_server(data)
         except Exception as e:
-            logger.error(f"Error updating offline status: {e}")
-        finally:
-            if self.client:
-                self.client.close()
+            logger.error(f"Error sending offline status: {e}")
         logger.info("Shutting down monitor...")
 
 if __name__ == "__main__":
     monitor = SystemMonitor(
         require_admin=True,
         monitor_path="C:\\Users\\Adnan\\Desktop\\Zyra",
-        config_files=[r"C:\Windows\System32\drivers\etc\hosts"]  # Customize as needed
+        config_files=[r"C:\Windows\System32\drivers\etc\hosts"]
     )
     try:
         monitor.start()

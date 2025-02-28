@@ -13,10 +13,8 @@ import sys
 import time
 import warnings
 
-# Suppress CryptographyDeprecationWarnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s - %(pathname)s:%(lineno)d',
@@ -24,15 +22,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# MongoDB credentials
 USERNAME = urllib.parse.quote_plus("zyraadmin")
 PASSWORD = urllib.parse.quote_plus("Hacker@66202")
 MONGO_URI = f"mongodb+srv://{USERNAME}:{PASSWORD}@zyracluster.9zq1b.mongodb.net/?retryWrites=true&w=majority&appName=ZyraCluster"
 
-# Initialize FastAPI app
 app = FastAPI(title="System Monitoring API", description="API to fetch and manage system monitoring data", version="1.0")
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,7 +36,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Middleware for request logging and timing
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = time.time()
@@ -51,19 +45,20 @@ async def log_requests(request: Request, call_next):
     logger.info(f"Request completed: {request.method} {request.url} - Status: {response.status_code} - Duration: {duration:.3f}s")
     return response
 
-# MongoDB client setup with connection pooling
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, maxPoolSize=10)
 
 def get_db():
     try:
         global client
-        client.admin.command('ping')  # Test connection
+        client.admin.command('ping')
         return client["siem_db"]
     except Exception as e:
         logger.error(f"Failed to connect to MongoDB: {str(e)} - {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Database connection failed")
 
-# Pydantic models
+# Replace with your actual VirusTotal API key
+VIRUSTOTAL_API_KEY = "your_virustotal_api_key_here"
+
 class CommandRequest(BaseModel):
     device_id: str
     command: str
@@ -87,7 +82,6 @@ class MonitoringData(BaseModel):
     data: dict
     timestamp: str
 
-# Helper function to serialize MongoDB documents
 def serialize_doc(doc):
     try:
         if "_id" in doc:
@@ -97,7 +91,6 @@ def serialize_doc(doc):
         logger.error(f"Error serializing document: {str(e)} - Document: {doc}")
         raise
 
-# Generic data fetching function
 async def fetch_device_data(device_id: str, data_type: str, limit: int = 100) -> List[MonitoringData]:
     db = None
     try:
@@ -120,7 +113,6 @@ async def fetch_device_data(device_id: str, data_type: str, limit: int = 100) ->
         logger.error(f"Error fetching {data_type} data for {device_id}: {str(e)} - {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-# Endpoint to receive monitoring data from agent and update agent_status if applicable
 @app.post("/api/v1/data", response_model=dict)
 async def receive_monitoring_data(data: MonitoringData):
     db = None
@@ -130,28 +122,33 @@ async def receive_monitoring_data(data: MonitoringData):
         result = collection.insert_one(data.dict())
         logger.info(f"Stored {data.type} data for device {data.device_id} with ID: {result.inserted_id}")
 
-        # Update agent_status collection if the data type is "agent_status"
         if data.type == "agent_status":
             status_collection = db["agent_status"]
             status_update = {
                 "device_id": data.device_id,
                 "hostname": data.hostname,
                 "status": data.data.get("status", "unknown"),
-                "last_seen": data.timestamp
+                "last_seen": data.timestamp,
+                "acknowledged": True
             }
             status_collection.update_one(
                 {"device_id": data.device_id},
                 {"$set": status_update},
                 upsert=True
             )
-            logger.info(f"Updated agent_status for device {data.device_id} with status {status_update['status']}")
+            logger.info(f"Updated and acknowledged agent_status for device {data.device_id} with status {status_update['status']}")
+        elif data.type == "process_alert":
+            logger.warning(f"Process alert received for {data.device_id}: {data.data.get('details')}")
+        elif data.type == "threat_intel":
+            logger.info(f"Threat intel received for {data.device_id}: {data.data.get('details')}")
+        elif data.type == "remote_response" and data.data.get("command") == "stop_service":
+            logger.info(f"Agent {data.device_id} acknowledged stop_service command")
 
         return {"status": "success", "inserted_id": str(result.inserted_id)}
     except Exception as e:
         logger.error(f"Error storing data: {str(e)} - {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-# Existing endpoints
 @app.get("/api/v1/agents/status", response_model=List[AgentStatus])
 async def get_agent_status():
     db = None
@@ -167,6 +164,15 @@ async def get_agent_status():
         raise he
     except Exception as e:
         logger.error(f"Error fetching agent status: {str(e)} - {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/api/v1/{device_id}/virustotal_key", response_model=dict)
+async def get_virustotal_key(device_id: str):
+    try:
+        # In production, add authentication to validate device_id
+        return {"virustotal_api_key": VIRUSTOTAL_API_KEY}
+    except Exception as e:
+        logger.error(f"Error providing VirusTotal key: {str(e)} - {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/api/v1/{device_id}/system", response_model=List[MonitoringData])
@@ -245,6 +251,18 @@ async def get_reboot_events_data(device_id: str, limit: int = 100):
 async def get_agent_status_data(device_id: str, limit: int = 100):
     return await fetch_device_data(device_id, "agent_status", limit)
 
+@app.get("/api/v1/{device_id}/process_alerts", response_model=List[MonitoringData])
+async def get_process_alerts_data(device_id: str, limit: int = 100):
+    return await fetch_device_data(device_id, "process_alert", limit)
+
+@app.get("/api/v1/{device_id}/threat_intel", response_model=List[MonitoringData])
+async def get_threat_intel_data(device_id: str, limit: int = 100):
+    return await fetch_device_data(device_id, "threat_intel", limit)
+
+@app.get("/api/v1/{device_id}/custom_alerts", response_model=List[MonitoringData])
+async def get_custom_alerts_data(device_id: str, limit: int = 100):
+    return await fetch_device_data(device_id, "custom_alert", limit)
+
 @app.post("/api/v1/commands", response_model=CommandResponse)
 async def send_command(command: CommandRequest):
     db = None
@@ -303,7 +321,6 @@ async def health_check():
         logger.error(f"Health check failed: {str(e)} - {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Database connection failed")
 
-# Signal handler for graceful shutdown
 def signal_handler(sig, frame):
     logger.info("Received shutdown signal, exiting gracefully...")
     client.close()

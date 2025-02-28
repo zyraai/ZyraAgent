@@ -20,9 +20,11 @@ import win32com.client
 import subprocess
 import hashlib
 import shutil
-import pkg_resources
+import win32serviceutil
+import win32service
+import win32event
+import servicemanager
 
-# Try importing scapy, install Npcap if it fails
 try:
     from scapy.all import sniff, DNS
 except ImportError:
@@ -30,7 +32,6 @@ except ImportError:
 else:
     scapy_installed = True
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -38,10 +39,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# API endpoint configuration
-API_BASE_URL = "https://zyrabackendapi.onrender.com"  # Update this to your server's URL if different
+API_BASE_URL = "https://zyrabackendapi.onrender.com/api/v1"
 
-# Dependency installation functions
 def is_admin():
     try:
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
@@ -60,31 +59,20 @@ def run_as_admin():
         logger.error(f"Failed to elevate privileges: {e}")
         return False
 
-def install_dependency(package_name):
-    """Install a Python package using pip."""
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
-        logger.info(f"Successfully installed {package_name}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to install {package_name}: {e}")
-        sys.exit(1)
-
 def check_and_install_npcap():
-    """Check for Npcap and install it silently if missing."""
     if not scapy_installed:
-        logger.warning("Scapy not installed, Npcap check skipped until Python dependencies are installed.")
-        return False
+        logger.error("Scapy is not installed. Please install it manually before running this script.")
+        sys.exit(1)
     try:
-        # Npcap is installed if scapy can sniff without errors
-        sniff(count=1, timeout=1)  # Quick test
+        sniff(count=1, timeout=1)
         logger.info("Npcap is already installed.")
         return True
     except Exception:
         logger.info("Npcap not detected, attempting installation...")
-        npcap_installer = "npcap-1.79.exe"  # Replace with latest version if needed
+        npcap_installer = "npcap-1.79.exe"
         if not os.path.exists(npcap_installer):
             logger.info("Downloading Npcap installer...")
-            npcap_url = "https://npcap.com/dist/npcap-1.79.exe"  # Update URL if version changes
+            npcap_url = "https://npcap.com/dist/npcap-1.79.exe"
             try:
                 response = requests.get(npcap_url, stream=True)
                 with open(npcap_installer, "wb") as f:
@@ -94,36 +82,20 @@ def check_and_install_npcap():
                 sys.exit(1)
         
         try:
-            # Silent install with WinPcap compatibility
             subprocess.check_call([npcap_installer, "/S", "/winpcap_mode=yes"])
             logger.info("Npcap installed successfully.")
-            return True
+            os.execv(sys.executable, [sys.executable] + sys.argv)
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to install Npcap: {e}")
             sys.exit(1)
 
-def install_requirements():
-    """Ensure all Python dependencies and Npcap are installed."""
+def ensure_npcap():
     if not is_admin():
-        logger.error("Admin privileges required to install dependencies.")
+        logger.error("Admin privileges required to check/install Npcap.")
         run_as_admin()
         sys.exit(1)
-
-    # List of required Python packages
-    required = {"requests", "psutil", "watchdog", "scapy", "pywin32"}
-    installed = {pkg.key for pkg in pkg_resources.working_set}
-    missing = required - installed
-
-    if missing:
-        logger.info(f"Installing missing Python packages: {missing}")
-        for pkg in missing:
-            install_dependency(pkg)
-        # Reload the script after installing dependencies
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-    # Check and install Npcap
     if not check_and_install_npcap():
-        logger.error("Npcap installation required for DNS sniffing but failed.")
+        logger.error("Npcap installation failed. DNS sniffing will not work.")
         sys.exit(1)
 
 class AnomalyDetector:
@@ -224,6 +196,11 @@ class SystemMonitor:
         self.agent_file = os.path.abspath(__file__)
         self.agent_hash = self._get_file_hash(self.agent_file)
         self.agent_pid = os.getpid()
+        self.virustotal_api_key = None
+        self.custom_rules = [
+            {"condition": lambda data: data.get("cpu_usage", 0) > 90, "duration": 300, "alert": "High CPU usage", "severity": "high"}
+        ]
+        self.rule_violations = {}
         
         if require_admin and not self.is_admin:
             logger.warning("Admin privileges required - attempting to elevate")
@@ -248,6 +225,17 @@ class SystemMonitor:
                 logger.error(f"Failed to send data: {response.status_code} - {response.text}")
         except Exception as e:
             logger.error(f"Error sending data to server: {e}")
+
+    def _fetch_virustotal_key(self):
+        try:
+            response = requests.get(f"{API_BASE_URL}/{self.device_id}/virustotal_key")
+            if response.status_code == 200:
+                self.virustotal_api_key = response.json()["virustotal_api_key"]
+                logger.info(f"Fetched VirusTotal API key for device {self.device_id}")
+            else:
+                logger.error(f"Failed to fetch VirusTotal API key: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Error fetching VirusTotal API key: {e}")
 
     def get_system_info(self):
         while self.running:
@@ -365,7 +353,7 @@ class SystemMonitor:
                             anomaly["device_id"] = self.device_id
                             anomaly["hostname"] = self.hostname
                             anomaly["data"] = {"system_name": self.system_name, **anomaly}
-                            del anomaly["timestamp"]  # Avoid nesting timestamp
+                            del anomaly["timestamp"]
                             anomaly["timestamp"] = datetime.now().isoformat()
                             self.data_queue.put(anomaly)
                 time.sleep(1)
@@ -534,7 +522,7 @@ class SystemMonitor:
                     flags = win32evtlog.EVENTLOG_FORWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
                     events = win32evtlog.ReadEventLog(hand, flags, 0)
                     for event in events:
-                        if event.EventID == 7036:  # Service start/stop
+                        if event.EventID == 7036:
                             timestamp = event.TimeGenerated.strftime('%Y-%m-%d %H:%M:%S')
                             service_name = event.StringInserts[0] if event.StringInserts else "Unknown"
                             state = event.StringInserts[1] if len(event.StringInserts) > 1 else "Unknown"
@@ -676,8 +664,10 @@ class SystemMonitor:
                                     process = psutil.Process(pid)
                                     process.terminate()
                                     result = f"Terminated process {pid}"
-                                except Exception as e:
+                                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
                                     result = f"Failed to terminate {pid}: {e}"
+                                except Exception as e:
+                                    result = f"Unexpected error terminating {pid}: {e}"
                             elif cmd == "collect_file" and "path" in cmd_doc:
                                 path = cmd_doc["path"]
                                 try:
@@ -686,6 +676,24 @@ class SystemMonitor:
                                     result = f"Collected {len(file_content)} bytes from {path}"
                                 except Exception as e:
                                     result = f"Failed to collect {path}: {e}"
+                            elif cmd == "stop_service":
+                                result = "Stopping service..."
+                                self.stop()  # Gracefully stop the service
+                                data = {
+                                    "device_id": self.device_id,
+                                    "hostname": self.hostname,
+                                    "type": "remote_response",
+                                    "data": {
+                                        "system_name": self.system_name,
+                                        "command": cmd,
+                                        "result": result,
+                                        "command_id": cmd_doc["command_id"]
+                                    },
+                                    "timestamp": datetime.now().isoformat()
+                                }
+                                self.data_queue.put(data)
+                                requests.put(f"{API_BASE_URL}/commands/{cmd_doc['command_id']}", json={"processed": True})
+                                sys.exit(0)  # Exit to allow service manager to stop
                             else:
                                 result = f"Unknown command: {cmd}"
                             
@@ -696,12 +704,12 @@ class SystemMonitor:
                                 "data": {
                                     "system_name": self.system_name,
                                     "command": cmd,
-                                    "result": result
+                                    "result": result,
+                                    "command_id": cmd_doc["command_id"]
                                 },
                                 "timestamp": datetime.now().isoformat()
                             }
                             self.data_queue.put(data)
-                            # Mark command as processed
                             requests.put(f"{API_BASE_URL}/commands/{cmd_doc['command_id']}", json={"processed": True})
                 time.sleep(5)
             except Exception as e:
@@ -744,6 +752,121 @@ class SystemMonitor:
                 logger.error(f"Error monitoring uptime: {e}")
                 time.sleep(10)
 
+    def monitor_processes(self):
+        known_locations = [r"C:\Windows", r"C:\Program Files", r"C:\Program Files (x86)"]
+        while self.running:
+            try:
+                for proc in psutil.process_iter(['pid', 'name', 'exe', 'cpu_percent', 'memory_percent', 'username']):
+                    try:
+                        exe_path = proc.info['exe']
+                        if not exe_path:
+                            continue
+                        
+                        is_suspicious = False
+                        details = []
+                        
+                        cpu_usage = proc.info['cpu_percent'] or 0
+                        memory_usage = proc.info['memory_percent'] or 0
+                        if cpu_usage > 80 or memory_usage > 50:
+                            details.append(f"High resource usage (CPU: {cpu_usage:.1f}%, Memory: {memory_usage:.1f}%)")
+                            is_suspicious = True
+                        
+                        if not any(exe_path.startswith(loc) for loc in known_locations):
+                            details.append(f"Unusual location: {exe_path}")
+                            is_suspicious = True
+                        
+                        if "powershell" in proc.info['name'].lower() or "cmd" in proc.info['name'].lower():
+                            details.append(f"Potential command-line tool misuse: {proc.info['name']}")
+                            is_suspicious = True
+
+                        if is_suspicious:
+                            data = {
+                                "device_id": self.device_id,
+                                "hostname": self.hostname,
+                                "type": "process_alert",
+                                "data": {
+                                    "system_name": self.system_name,
+                                    "pid": proc.info['pid'],
+                                    "name": proc.info['name'],
+                                    "exe_path": exe_path,
+                                    "username": proc.info['username'] or "N/A",
+                                    "details": "; ".join(details),
+                                    "severity": "medium"
+                                },
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            self.data_queue.put(data)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                time.sleep(5)
+            except Exception as e:
+                logger.error(f"Error monitoring processes: {e}")
+                time.sleep(5)
+
+    def monitor_threat_intel(self):
+        if not self.virustotal_api_key:
+            self._fetch_virustotal_key()
+            if not self.virustotal_api_key:
+                logger.error("VirusTotal API key not available - skipping threat intel")
+                return
+        
+        vt_url = "https://www.virustotal.com/api/v3"
+        headers = {"x-apikey": self.virustotal_api_key}
+        
+        while self.running:
+            try:
+                dns_data = self.data_queue.queue
+                for item in list(dns_data):
+                    if item.get("type") == "dns_query":
+                        domain = item["data"]["domain"]
+                        response = requests.get(f"{vt_url}/domains/{domain}", headers=headers)
+                        if response.status_code == 200:
+                            result = response.json()
+                            positives = result["data"]["attributes"]["last_analysis_stats"]["malicious"]
+                            if positives > 0:
+                                data = {
+                                    "device_id": self.device_id,
+                                    "hostname": self.hostname,
+                                    "type": "threat_intel",
+                                    "data": {
+                                        "system_name": self.system_name,
+                                        "indicator_type": "domain",
+                                        "indicator": domain,
+                                        "positives": positives,
+                                        "details": "Malicious domain detected by VirusTotal"
+                                    },
+                                    "timestamp": datetime.now().isoformat()
+                                }
+                                self.data_queue.put(data)
+
+                for config_file in self.config_files:
+                    if os.path.exists(config_file):
+                        file_hash = self._get_file_hash(config_file)
+                        if file_hash:
+                            response = requests.get(f"{vt_url}/files/{file_hash}", headers=headers)
+                            if response.status_code == 200:
+                                result = response.json()
+                                positives = result["data"]["attributes"]["last_analysis_stats"]["malicious"]
+                                if positives > 0:
+                                    data = {
+                                        "device_id": self.device_id,
+                                        "hostname": self.hostname,
+                                        "type": "threat_intel",
+                                        "data": {
+                                            "system_name": self.system_name,
+                                            "indicator_type": "file_hash",
+                                            "indicator": file_hash,
+                                            "positives": positives,
+                                            "details": "Malicious file detected by VirusTotal"
+                                        },
+                                        "timestamp": datetime.now().isoformat()
+                                    }
+                                    self.data_queue.put(data)
+                time.sleep(60)
+            except Exception as e:
+                logger.error(f"Error in threat intel monitoring: {e}")
+                time.sleep(60)
+
     def update_agent_status(self):
         while self.running:
             try:
@@ -758,10 +881,47 @@ class SystemMonitor:
                     "timestamp": datetime.now().isoformat()
                 }
                 self.data_queue.put(data)
-                time.sleep(30)  # Update every 30 seconds
+                response = requests.post(f"{API_BASE_URL}/data", json=data)
+                if response.status_code != 200 or not response.json().get("status") == "success":
+                    logger.warning("Server did not acknowledge agent status - retrying")
+                    time.sleep(5)
+                    continue
+                time.sleep(30)
             except Exception as e:
                 logger.error(f"Error updating agent status: {e}")
                 time.sleep(30)
+
+    def monitor_custom_rules(self):
+        while self.running:
+            try:
+                system_data = list(self.data_queue.queue)
+                for item in system_data:
+                    if item.get("type") == "system":
+                        for rule in self.custom_rules:
+                            if rule["condition"](item["data"]):
+                                rule_key = f"{rule['alert']}_{item['timestamp']}"
+                                if rule_key not in self.rule_violations:
+                                    self.rule_violations[rule_key] = {"start": time.time(), "count": 1}
+                                else:
+                                    self.rule_violations[rule_key]["count"] += 1
+                                    if time.time() - self.rule_violations[rule_key]["start"] >= rule["duration"]:
+                                        data = {
+                                            "device_id": self.device_id,
+                                            "hostname": self.hostname,
+                                            "type": "custom_alert",
+                                            "data": {
+                                                "system_name": self.system_name,
+                                                "details": rule["alert"],
+                                                "severity": rule["severity"]
+                                            },
+                                            "timestamp": datetime.now().isoformat()
+                                        }
+                                        self.data_queue.put(data)
+                                        del self.rule_violations[rule_key]
+                time.sleep(5)
+            except Exception as e:
+                logger.error(f"Error monitoring custom rules: {e}")
+                time.sleep(5)
 
     def store_data(self):
         while self.running:
@@ -785,7 +945,9 @@ class SystemMonitor:
         logger.info(f"Monitoring file events in: {self.monitor_path}")
         logger.info(f"Monitoring config files: {self.config_files}")
 
-        threads = [
+        self._fetch_virustotal_key()
+
+        self.threads = [
             threading.Thread(target=self.get_system_info, daemon=True),
             threading.Thread(target=self.get_network_stats, daemon=True),
             threading.Thread(target=self.capture_dns_queries, daemon=True),
@@ -801,15 +963,17 @@ class SystemMonitor:
             threading.Thread(target=self.remote_control, daemon=True),
             threading.Thread(target=self.monitor_uptime, daemon=True),
             threading.Thread(target=self.update_agent_status, daemon=True),
+            threading.Thread(target=self.monitor_processes, daemon=True),
+            threading.Thread(target=self.monitor_threat_intel, daemon=True),
+            threading.Thread(target=self.monitor_custom_rules, daemon=True),
             threading.Thread(target=self.store_data, daemon=True)
         ]
 
-        for thread in threads:
+        for thread in self.threads:
             thread.start()
 
     def stop(self):
         self.running = False
-        # Send offline status
         try:
             data = {
                 "device_id": self.device_id,
@@ -825,19 +989,42 @@ class SystemMonitor:
         except Exception as e:
             logger.error(f"Error sending offline status: {e}")
         logger.info("Shutting down monitor...")
+        # Wait briefly for threads to finish
+        for thread in self.threads:
+            thread.join(timeout=2)
+
+class SIEMAgentService(win32serviceutil.ServiceFramework):
+    _svc_name_ = "SIEMAgentService"
+    _svc_display_name_ = "SIEM Agent Service"
+    _svc_description_ = "Monitors system activity and reports to SIEM server"
+
+    def __init__(self, args):
+        win32serviceutil.ServiceFramework.__init__(self, args)
+        self.hWaitStop = win32event.CreateEvent(None, 0, 0, None)
+        self.monitor = SystemMonitor(
+            require_admin=True,
+            monitor_path="C:\\Users",
+            config_files=[r"C:\Windows\System32\drivers\etc\hosts"]
+        )
+
+    def SvcStop(self):
+        self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+        win32event.SetEvent(self.hWaitStop)
+        self.monitor.stop()
+        self.ReportServiceStatus(win32service.SERVICE_STOPPED)
+
+    def SvcDoRun(self):
+        servicemanager.LogMsg(servicemanager.EVENTLOG_INFORMATION_TYPE,
+                              servicemanager.PYS_SERVICE_STARTED,
+                              (self._svc_name_, ''))
+        self.monitor.start()
+        win32event.WaitForSingleObject(self.hWaitStop, win32event.INFINITE)
 
 if __name__ == "__main__":
-    # Check and install dependencies before starting
-    install_requirements()
-    
-    monitor = SystemMonitor(
-        require_admin=True,
-        monitor_path="C:\\Users",
-        config_files=[r"C:\Windows\System32\drivers\etc\hosts"]
-    )
-    try:
-        monitor.start()
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        monitor.stop()
+    if len(sys.argv) == 1:
+        ensure_npcap()
+        servicemanager.Initialize()
+        servicemanager.PrepareToHostSingle(SIEMAgentService)
+        servicemanager.StartServiceCtrlDispatcher()
+    else:
+        win32serviceutil.HandleCommandLine(SIEMAgentService)
